@@ -1,0 +1,8 @@
+Revision history for HuggingFace::API
+
+{{$NEXT}}
+
+0.1.0  2026-04-08T01:08:13+01:00
+    - Initial release
+    - search: search HuggingFace models by prefix
+    - get-tokenizer: download tokenizer.json for a model

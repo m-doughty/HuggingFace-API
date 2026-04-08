@@ -1,0 +1,31 @@
+{
+  "auth": "zef:apogee",
+  "authors": [
+    "Matt Doughty"
+  ],
+  "build-depends": [
+  ],
+  "depends": [
+    "Cro::HTTP",
+    "JSON::Fast:auth<cpan:TIMOTIMO>"
+  ],
+  "description": "Raku client for the HuggingFace API — model search and tokenizer downloads",
+  "license": "Artistic-2.0",
+  "name": "HuggingFace::API",
+  "perl": "6.d",
+  "provides": {
+    "HuggingFace::API": "lib/HuggingFace/API.rakumod"
+  },
+  "resources": [
+  ],
+  "source-url": "https://github.com/m-doughty/HuggingFace-API.git",
+  "tags": [
+    "huggingface",
+    "tokenizer",
+    "api",
+    "llm"
+  ],
+  "test-depends": [
+  ],
+  "version": "0.1.0"
+}

@@ -1,0 +1,53 @@
+use Test;
+use lib 'lib';
+use HuggingFace::API;
+use JSON::Fast;
+
+plan 6;
+
+my HuggingFace::API $hf .= new;
+
+subtest 'search returns results' => {
+	plan 2;
+	my @results = $hf.search('mistral', :limit(3));
+	ok @results.elems > 0, 'Got results';
+	ok @results[0]<id>.defined, 'Result has id';
+};
+
+subtest 'search results have expected fields' => {
+	plan 3;
+	my @results = $hf.search('llama', :limit(1));
+	my %model = @results[0];
+	ok %model<id>.chars > 0, 'Has model id';
+	ok %model<downloads>.defined, 'Has downloads count';
+	ok %model<likes>.defined, 'Has likes count';
+};
+
+subtest 'search with limit' => {
+	plan 1;
+	my @results = $hf.search('gpt', :limit(5));
+	ok @results.elems <= 5, 'Respects limit';
+};
+
+subtest 'search no results for garbage' => {
+	plan 1;
+	my @results = $hf.search('xyzzy_nonexistent_model_12345', :limit(5));
+	is @results.elems, 0, 'No results for nonsense query';
+};
+
+subtest 'get-tokenizer downloads JSON' => {
+	plan 2;
+	my Str:D $json = $hf.get-tokenizer('mistralai/Mistral-7B-v0.1');
+	ok $json.chars > 1000, "Tokenizer JSON is {$json.chars} chars";
+	my %parsed = from-json($json);
+	ok (%parsed<model>:exists) || (%parsed<version>:exists), 'Looks like valid tokenizer JSON';
+};
+
+subtest 'get-tokenizer-to-file saves to disk' => {
+	plan 2;
+	my IO::Path $tmp = $*TMPDIR.add("hf-test-tokenizer-{$*PID}.json");
+	$hf.get-tokenizer-to-file('mistralai/Mistral-7B-v0.1', $tmp);
+	ok $tmp.e, 'File created';
+	ok $tmp.s > 1000, "File is {$tmp.s} bytes";
+	$tmp.unlink;
+};
