@@ -48,3 +48,15 @@ method get-tokenizer-to-file(Str:D $model-id, IO::Path:D $output, Str :$filename
 	$output.spurt($json);
 	$output;
 }
+
+method get-tokenizer-config(Str:D $model-id --> Str:D) {
+	my $url = "$!base-url/$model-id/resolve/main/tokenizer_config.json";
+	my $resp = await self!client.get($url);
+	await $resp.body-text;
+}
+
+method get-tokenizer-config-to-file(Str:D $model-id, IO::Path:D $output --> IO::Path:D) {
+	my Str:D $json = self.get-tokenizer-config($model-id);
+	$output.spurt($json);
+	$output;
+}

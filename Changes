@@ -2,6 +2,10 @@ Revision history for HuggingFace::API
 
 {{$NEXT}}
 
+0.1.1  2026-04-09T05:16:31+01:00
+    - get-tokenizer-config: download tokenizer_config.json for a model
+    - get-tokenizer-config-to-file: download tokenizer_config.json to a file
+
 0.1.0  2026-04-08T01:08:13+01:00
     - Initial release
     - search: search HuggingFace models by prefix
