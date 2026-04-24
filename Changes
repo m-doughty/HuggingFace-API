@@ -2,6 +2,30 @@ Revision history for HuggingFace::API
 
 {{$NEXT}}
 
+0.2.0  2026-04-24T06:05:51+01:00
+    - New: get-file($model-id, $filename, :$revision) — download
+      any file from a HuggingFace repo as text. Generalises the
+      existing tokenizer-only downloads to arbitrary filenames.
+    - New: get-file-blob($model-id, $filename, :$revision) —
+      binary-safe variant that returns a Blob. Required for
+      anything that isn't UTF-8 text (ONNX weights, safetensors,
+      tarballs); text decode corrupts non-UTF8 bytes.
+    - New: get-file-to-file($model-id, $filename, $output,
+      :$revision) — streams the file to disk, binary-safe. Used
+      by LLM::Classifiers::Emotions's Build.rakumod to fetch the
+      pinned go-emotions model files at install time.
+    - Existing get-tokenizer / get-tokenizer-to-file /
+      get-tokenizer-config / get-tokenizer-config-to-file now
+      accept a :$revision parameter (default 'main' for
+      back-compat). Consumers that want a reproducible install
+      should pin a specific commit SHA — matters when models
+      get updated and you want deterministic behaviour across
+      installs.
+    - All signatures add optional parameters with safe defaults;
+      0.1.x callers (App-Kelpie, App-Cantina) work unchanged.
+    - Version bump to 0.2.0 — new methods, no removals, no
+      behaviour changes to existing ones.
+
 0.1.1  2026-04-09T05:16:31+01:00
     - get-tokenizer-config: download tokenizer_config.json for a model
     - get-tokenizer-config-to-file: download tokenizer_config.json to a file

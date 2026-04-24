@@ -6,8 +6,8 @@
   "build-depends": [
   ],
   "depends": [
-    "Cro::HTTP",
-    "JSON::Fast:auth<cpan:TIMOTIMO>"
+    "Cro::HTTP:ver<0.8.11>:auth<zef:cro>",
+    "JSON::Fast:ver<0.19>:auth<cpan:TIMOTIMO>"
   ],
   "description": "Raku client for the HuggingFace API — model search and tokenizer downloads",
   "license": "Artistic-2.0",
@@ -27,5 +27,5 @@
   ],
   "test-depends": [
   ],
-  "version": "0.1.1"
+  "version": "0.2.0"
 }
