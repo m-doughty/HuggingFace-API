@@ -1,0 +1,144 @@
+use Test;
+use lib 'lib';
+use HuggingFace::API;
+use JSON::Fast;
+
+plan 11;
+
+# === Pure-function tests for extract-chat-template-from-config ===
+# These exercise every shape we expect to encounter in real HF
+# tokenizer_config.json files without hitting the network.
+
+subtest 'extract: string-form chat_template' => {
+	plan 1;
+	my $json = to-json(%(
+		chat_template => '{{- bos_token }}{% for m in messages %}{{ m.content }}{% endfor %}',
+	));
+	is extract-chat-template-from-config($json),
+		'{{- bos_token }}{% for m in messages %}{{ m.content }}{% endfor %}',
+		'String form returned verbatim';
+};
+
+subtest 'extract: array-form picks "default" entry' => {
+	plan 1;
+	# Cohere Command A and other multi-template repos ship a list of
+	# {name, template} hashes. The 'default' name is the one ST and
+	# transformers.js use when no explicit template name is selected.
+	my $json = to-json(%(
+		chat_template => [
+			%(name => 'tool_use', template => 'TOOL_USE_TEMPLATE'),
+			%(name => 'default',  template => 'DEFAULT_TEMPLATE'),
+			%(name => 'rag',      template => 'RAG_TEMPLATE'),
+		],
+	));
+	is extract-chat-template-from-config($json), 'DEFAULT_TEMPLATE',
+		'Selects the entry named "default"';
+};
+
+subtest 'extract: array-form falls back to first entry' => {
+	plan 1;
+	my $json = to-json(%(
+		chat_template => [
+			%(name => 'first',  template => 'FIRST'),
+			%(name => 'second', template => 'SECOND'),
+		],
+	));
+	is extract-chat-template-from-config($json), 'FIRST',
+		'Falls back to first when no "default" name';
+};
+
+subtest 'extract: missing chat_template returns Str (undef)' => {
+	plan 2;
+	my $json = to-json(%(model_max_length => 32768, eos_token => '</s>'));
+	my $result = extract-chat-template-from-config($json);
+	nok $result.defined, 'Returns undefined Str';
+	isa-ok $result, Str, 'Type is still Str';
+};
+
+subtest 'extract: empty-string chat_template returned as-is' => {
+	plan 2;
+	# Some repos ship chat_template: "" as a deliberate signal that
+	# the model has no chat template — distinct from the field being
+	# absent. We surface this verbatim so callers can distinguish.
+	my $json = to-json(%(chat_template => ''));
+	my $result = extract-chat-template-from-config($json);
+	ok $result.defined, 'Empty string is defined';
+	is $result, '', 'Empty string preserved';
+};
+
+subtest 'extract: malformed JSON returns Str (undef)' => {
+	plan 1;
+	my $result = extract-chat-template-from-config('not actually json {[');
+	nok $result.defined, 'Bad JSON returns undefined rather than throwing';
+};
+
+subtest 'extract: array-form with no usable entries returns Str' => {
+	plan 1;
+	# Defensive: pathological config where the array exists but no
+	# entry has a template field.
+	my $json = to-json(%(
+		chat_template => [
+			%(name => 'a'),
+			%(name => 'b'),
+		],
+	));
+	nok extract-chat-template-from-config($json).defined,
+		'No template fields → undefined';
+};
+
+# === Integration tests against real HuggingFace endpoints ===
+
+my HuggingFace::API $hf .= new;
+
+subtest 'get-chat-template: prefers chat_template.jinja when present' => {
+	plan 3;
+	# Mistral-Small-4-119B-2603 ships chat_template.jinja standalone
+	# (verified at time of writing via direct HEAD against /raw/main).
+	my Str $template = $hf.get-chat-template('mistralai/Mistral-Small-4-119B-2603');
+	ok $template.defined, 'Template was fetched';
+	ok $template.chars > 1000, "Template is { $template.chars } chars (full Mistral template)";
+	ok $template.contains('SYSTEM_PROMPT') || $template.contains('INST'),
+		'Looks like a Mistral chat template';
+};
+
+subtest 'get-chat-template: falls back to tokenizer_config.json' => {
+	plan 3;
+	# Mistral-7B-Instruct-v0.2 has no standalone chat_template.jinja
+	# (404) but does have chat_template embedded in tokenizer_config
+	# as a ~1KB string. This exercises the fallback path.
+	my Str $template = $hf.get-chat-template('mistralai/Mistral-7B-Instruct-v0.2');
+	ok $template.defined, 'Fallback template was fetched';
+	ok $template.chars > 100, "Fallback template is { $template.chars } chars";
+	ok $template.contains('INST') || $template.contains('messages'),
+		'Looks like a Mistral chat template';
+};
+
+subtest 'get-chat-template: returns undef when neither source exists' => {
+	plan 1;
+	# Cohee/distilbert is a sequence classifier with tokenizer_config
+	# but no chat_template field and no standalone .jinja file. Pinned
+	# revision so this remains stable across upstream changes.
+	my Str $template = $hf.get-chat-template(
+		'Cohee/distilbert-base-uncased-go-emotions-onnx',
+		:revision('d22488bc83be87678f12eee8a3f65a65de94ef85'),
+	);
+	nok $template.defined, 'No template available → undefined';
+};
+
+subtest 'get-chat-template-to-file: writes template to disk' => {
+	plan 4;
+	my IO::Path $tmp = $*TMPDIR.add("hf-chat-template-{$*PID}.jinja");
+	$tmp.unlink if $tmp.e;
+
+	my IO::Path $result = $hf.get-chat-template-to-file(
+		'mistralai/Mistral-Small-4-119B-2603',
+		$tmp,
+	);
+	ok $result.defined, 'Returned a path';
+	is $result.absolute, $tmp.absolute, 'Returned the supplied path';
+	ok $tmp.e, 'File created on disk';
+	ok $tmp.s > 1000, "File is { $tmp.s } bytes";
+	$tmp.unlink;
+};
+
+done-testing;

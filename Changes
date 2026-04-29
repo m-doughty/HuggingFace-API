@@ -2,6 +2,26 @@ Revision history for HuggingFace::API
 
 {{$NEXT}}
 
+0.2.1  2026-04-29T23:44:09+01:00
+    - Bump Github actions to use node 24+
+    - New: get-chat-template($model-id, :$revision) — fetch a
+      model's Jinja chat template, trying chat_template.jinja
+      first and falling back to extracting chat_template from
+      tokenizer_config.json. Modern HF uploads ship the template
+      as a standalone .jinja file; older repos embed it as a
+      string in the config. Returns Str (undefined) when the
+      model has neither source.
+    - New: get-chat-template-to-file($model-id, $output, :$revision)
+      — variant that writes the resolved template to disk. Returns
+      the output path on success or IO::Path (undefined) when no
+      template was found, leaving the target untouched.
+    - New: extract-chat-template-from-config($json) — exported sub
+      that parses a tokenizer_config.json payload and returns the
+      template string. Handles both the bare-string form and the
+      list-of-{name, template} form (Cohere Command A and similar
+      multi-template repos). Selects the entry named "default"
+      when present, falling back to the first list entry.
+
 0.2.0  2026-04-24T06:05:51+01:00
     - New: get-file($model-id, $filename, :$revision) — download
       any file from a HuggingFace repo as text. Generalises the
