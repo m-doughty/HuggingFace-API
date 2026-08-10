@@ -60,11 +60,73 @@ method !headers(--> List) {
 	@h;
 }
 
+#|( Decode response bytes as text ourselves rather than letting Cro
+    do it.
+
+    Cro asks C<body-text-encoding> for an encoding, and when the
+    Content-Type names no charset that method returns the LIST
+    C<('utf-8', 'latin-1')> (Cro::HTTP::Message). C<body-text> in
+    Cro::MessageWithBody then loops over that list with no C<last>, so
+    the latin-1 attempt — which cannot fail, whatever the bytes are —
+    always overwrites the successful utf-8 decode. Every charset-less
+    response therefore came back as mojibake: café -> cafÃ©.
+
+    Everything this client reads as text is UTF-8 by definition or by
+    convention: the C</api/models> search results are JSON (UTF-8 per
+    RFC 8259 §8.1), and repo files fetched as text are tokenizer
+    configs, C<config.json> and Jinja chat templates — all
+    UTF-8-encoded, and all dense with non-ASCII (byte-level BPE vocab
+    tokens live in U+0100..U+01FF, and templates carry special tokens
+    and punctuation from every script). Getting that wrong is not a
+    cosmetic problem: C<get-tokenizer-to-file> and
+    C<get-chat-template-to-file> C<spurt> the decoded string back out
+    as UTF-8, so a latin-1 misread is written to disk permanently
+    double-encoded.
+
+    huggingface.co itself currently labels text files
+    C<text/plain; charset=utf-8>, but C<base-url> is settable and
+    routinely points at mirrors, self-hosted hubs and caching
+    proxies; LFS / xet redirects already answer
+    C<application/octet-stream> with no charset at all. The decode
+    should not depend on which of those the caller is pointed at.
+
+    latin-1 survives only as a fallback for genuinely non-UTF-8
+    bytes — the case C<get-file>'s docs already send callers to
+    C<get-file-blob> for — and is reached only when the utf-8 decode
+    throws, never in preference to a decode that worked.
+
+    Never throws: an undefined, empty or undecodable blob all read as
+    the empty string. )
+method _blob-text($blob --> Str:D) {
+	# Untyped on purpose — callers hand us whatever the body await
+	# produced, and this is the helper that must not itself be the
+	# thing that throws.
+	return '' unless $blob ~~ Blob:D;
+	(try $blob.decode('utf-8')) // (try $blob.decode('latin-1')) // '';
+}
+
+#|( C<_blob-text> over a whole response.
+
+    Unlike C<_blob-text> this B<does> propagate: C<await .body-blob>
+    is deliberately left bare so a connection dropped mid-body still
+    surfaces as a transport exception — the HTTP failures
+    C<!try-get-file> classifies (404 => absent, everything else
+    rethrown) have to stay distinguishable from a body that simply
+    would not decode.
+
+    Note this reads the raw bytes rather than C<await .body>, which
+    routes through Cro's body-parser selector and so depends on the
+    server's Content-Type rather than on the payload — an
+    C<application/octet-stream> repo file would come back as a Buf,
+    not a Str. )
+method _body-text($resp --> Str:D) {
+	self._blob-text(await $resp.body-blob);
+}
+
 method search(Str:D $query, Int:D :$limit = 10 --> List) {
 	my $url = "$!base-url/api/models?search=$query&limit=$limit";
 	my $resp = await self!client.get($url);
-	my $json = await $resp.body-text;
-	my @models = from-json($json).list;
+	my @models = from-json(self._body-text($resp)).list;
 	@models.map(-> %m {
 		%(
 			id          => %m<modelId> // %m<id> // '',
@@ -89,7 +151,7 @@ method get-file(Str:D $model-id, Str:D $filename,
                 Str:D :$revision = 'main' --> Str:D) {
 	my $url = "$!base-url/$model-id/resolve/$revision/$filename";
 	my $resp = await self!client.get($url);
-	await $resp.body-text;
+	self._body-text($resp);
 }
 
 #| Download any file from a HuggingFace repo as a Blob. Safe for
@@ -190,7 +252,7 @@ method !try-get-file(Str:D $model-id, Str:D $filename,
 	my $body;
 	try {
 		my $resp = await self!client.get($url);
-		$body = await $resp.body-text;
+		$body = self._body-text($resp);
 		CATCH {
 			when X::Cro::HTTP::Error::Client {
 				return Str if .response.status == 404;

@@ -1,0 +1,295 @@
+use Test;
+use lib 'lib';
+
+use Cro::HTTP::Client;
+use Cro::HTTP::Router;
+use Cro::HTTP::Server;
+use JSON::Fast;
+
+use HuggingFace::API;
+
+# Response-body decoding, against a real HTTP server.
+#
+# Cro::HTTP::Message.body-text-encoding returns the LIST
+# ('utf-8', 'latin-1') whenever the Content-Type names no charset, and
+# Cro::MessageWithBody.body-text loops that list with no `last` — so the
+# latin-1 attempt, which cannot fail whatever the bytes are, always
+# overwrites the correct utf-8 decode. Everything this client reads as
+# text is UTF-8: JSON search results, tokenizer configs, and Jinja chat
+# templates, all dense with non-ASCII (byte-level BPE vocab tokens live
+# in U+0100..U+01FF alone). Anything routed through body-text came back
+# as mojibake: café -> cafÃ© — and the *-to-file helpers then spurt that
+# back out as UTF-8, so the corruption lands on disk double-encoded.
+#
+# huggingface.co currently labels its text files `text/plain;
+# charset=utf-8`, but `base-url` is settable and routinely points at
+# mirrors, private hubs and caching proxies, and LFS / xet redirects
+# already answer `application/octet-stream` with no charset at all. The
+# fixture below is that server: every route answers charset-less bytes,
+# and every assertion is that the text survived byte for byte.
+
+plan 8;
+
+# Non-ASCII from every corner that bites a latin-1 decode: 2-byte
+# accented latin, 3-byte symbol, 3-byte CJK, curly punctuation, and a
+# 4-byte astral-plane emoji.
+constant SAMPLE   = "café ✓ 日本語 — “quoted” 🎲";
+constant AUTHOR   = "Ünïcødé Labs ✓";
+# Single-quoted: the Jinja braces would otherwise parse as Raku
+# interpolation blocks.
+constant TEMPLATE = '{%- for m in messages %}«{{ m.content }}» — 日本語 🎲{% endfor %}';
+
+# Real tokenizer vocabularies are full of these: byte-level BPE maps
+# raw bytes onto U+0100..U+01FF, and 'Ġ' (U+0120) is the space marker
+# in every GPT-2-lineage tokenizer.
+constant VOCAB-TOKEN = "Ġcafé";
+
+# Not valid UTF-8 anywhere — an ONNX/safetensors payload's worth of
+# nonsense. If get-file-blob ever stopped being blob-clean this would
+# not survive.
+constant BINARY = Blob.new(0x00, 0xFF, 0xFE, 0xE9, 0x80, 0xC0, 0x89, 0x50);
+
+constant TIMEOUT = 30;
+
+sub json-blob(\payload --> Blob) {
+	to-json(payload, :!pretty).encode('utf-8');
+}
+
+#| Await $promise, giving up (loudly) rather than blocking forever.
+sub timed($promise, Str:D $what) {
+	await Promise.anyof($promise, Promise.in(TIMEOUT));
+	die "Timed out after {TIMEOUT}s waiting for $what" if $promise.status === Planned;
+	$promise.result;
+}
+
+# Held rather than rebuilt per request so the on-disk-size assertion
+# below has an exact figure to compare against. (Key order out of
+# to-json is not pinned, but the byte count is.)
+my Blob $TOKENIZER-BODY = json-blob({
+	version => '1.0',
+	# Parenthesised: a bareword left of => is auto-quoted, so
+	# `VOCAB-TOKEN => 1` would key on the constant's *name*.
+	model   => { vocab => { (VOCAB-TOKEN) => 1, 'plain' => 2 } },
+});
+
+# === The fixture server ===
+#
+# Cro's `content` only appends a charset when handed a Str, so every
+# route below — all of which hand it a Blob — answers with a
+# Content-Type carrying no charset parameter. That is the shape that
+# trips Cro's fallback, and the shape HF's own LFS redirects use.
+
+my $app = route {
+	get -> 'api', 'models' {
+		# Trailing comma is load-bearing: `[ %h ]` hits the single-arg
+		# rule and flattens the Hash into one array element per Pair.
+		content 'application/json', json-blob([
+			{
+				modelId      => 'enc/modèle-café',
+				author       => AUTHOR,
+				downloads    => 4242,
+				likes        => 17,
+				pipeline_tag => 'text-generation',
+				tags         => [ 'café', '日本語' ],
+				description  => SAMPLE,
+			},
+		]);
+	}
+
+	# A repo that ships the standalone Jinja template. Served as
+	# application/octet-stream, the way an LFS / xet redirect does.
+	get -> 'enc', 'withjinja', 'resolve', $rev, 'chat_template.jinja' {
+		content 'application/octet-stream', TEMPLATE.encode('utf-8');
+	}
+
+	get -> 'enc', 'withjinja', 'resolve', $rev, 'tokenizer.json' {
+		content 'application/octet-stream', $TOKENIZER-BODY;
+	}
+
+	get -> 'enc', 'withjinja', 'resolve', $rev, 'model.bin' {
+		content 'application/octet-stream', BINARY;
+	}
+
+	# A repo with no standalone .jinja — get-chat-template must 404 its
+	# way through to the embedded config field.
+	get -> 'enc', 'nojinja', 'resolve', $rev, 'chat_template.jinja' {
+		not-found;
+	}
+
+	get -> 'enc', 'nojinja', 'resolve', $rev, 'tokenizer_config.json' {
+		content 'application/octet-stream', json-blob({
+			model_max_length => 32768,
+			chat_template    => TEMPLATE,
+		});
+	}
+
+	# A repo with neither source: both probes 404.
+	get -> 'enc', 'bare', 'resolve', $rev, $filename {
+		not-found;
+	}
+};
+
+#| Start the fixture on a random high port, retrying in case something
+#| else already owns the one we picked. Cro cannot report the port an
+#| OS-assigned :port(0) landed on, so the port is chosen here and a real
+#| request is the only honest proof that the listener is ours.
+sub boot(--> List) {
+	my $last-error = 'no attempt made';
+
+	for ^5 {
+		my $port   = (20000 .. 40000).pick;
+		my $server = Cro::HTTP::Server.new(
+			:host<127.0.0.1>, :$port, application => $app,
+		);
+
+		my Bool $listening = True;
+		{
+			CATCH {
+				default {
+					$last-error = .message.lines.head;
+					$listening  = False;
+				}
+			}
+			$server.start;
+		}
+
+		if $listening {
+			my $probe = Cro::HTTP::Client.new(:!persistent, :http<1.1>)
+				.get("http://127.0.0.1:$port/api/models?search=x&limit=1");
+			await Promise.anyof($probe, Promise.in(10));
+			return ($server, $port) if $probe.status === Kept;
+
+			$last-error = $probe.status === Broken
+				?? $probe.cause.message.lines.head
+				!! 'probe request timed out';
+			try $server.stop;
+		}
+	}
+
+	die "Could not start the fixture server on any port: $last-error";
+}
+
+my ($server, $port) = boot();
+LEAVE { try $server.stop with $server }
+
+my Str:D $base = "http://127.0.0.1:$port";
+my HuggingFace::API $hf .= new(:base-url($base));
+
+# === 1: the decode helper in isolation ===
+
+subtest 'the decode helper' => {
+	plan 6;
+
+	is $hf._blob-text(SAMPLE.encode('utf-8')), SAMPLE,
+		'multi-byte UTF-8 survives the round trip';
+	is $hf._blob-text(SAMPLE.encode('utf-8')).chars, SAMPLE.chars,
+		'no latin-1 expansion into one character per byte';
+	is $hf._blob-text(VOCAB-TOKEN.encode('utf-8')), VOCAB-TOKEN,
+		'byte-level BPE vocab tokens survive';
+	# 0xE9 alone is 'é' in latin-1 and an invalid UTF-8 lead byte, so it
+	# can only come back via the fallback.
+	is $hf._blob-text(Blob.new(0xE9, 0x21)), 'é!',
+		'undecodable UTF-8 falls back to latin-1';
+	is $hf._blob-text(Blob.new), '',
+		'an empty body reads as the empty string';
+	is $hf._blob-text(Blob), '',
+		'an undefined body reads as the empty string rather than throwing';
+};
+
+# === 2: the fixture's own premise ===
+
+subtest 'the fixture really does omit the charset' => {
+	plan 3;
+
+	# If this ever stops holding, every round-trip assertion below goes
+	# vacuous: Cro's body-text is correct when a charset is declared.
+	my $http = Cro::HTTP::Client.new(:!persistent, :http<1.1>);
+
+	my $api = timed($http.get("$base/api/models?search=x&limit=1"),
+		'the search charset probe');
+	my $api-type = $api.header('content-type') // '';
+	like $api-type, /^ 'application/json' /, 'search served as application/json';
+	unlike $api-type, /:i 'charset'/, 'with no charset parameter';
+
+	my $file = timed($http.get("$base/enc/withjinja/resolve/main/chat_template.jinja"),
+		'the file charset probe');
+	unlike $file.header('content-type') // '', /:i 'charset'/,
+		'and repo files carry no charset either';
+};
+
+# === 3-7: the text paths ===
+
+subtest 'search round-trips non-ASCII metadata' => {
+	plan 5;
+	my @models = $hf.search('café', :limit(1));
+
+	is @models.elems, 1, 'one model came back';
+	is @models[0]<id>, 'enc/modèle-café', 'model id survived the round trip';
+	is @models[0]<author>, AUTHOR, 'author survived the round trip';
+	is @models[0]<description>, SAMPLE, 'description survived byte for byte';
+	is-deeply @models[0]<tags>.Array, [ 'café', '日本語' ],
+		'tags survived the round trip';
+};
+
+subtest 'get-file round-trips a charset-less text body' => {
+	plan 2;
+	my Str:D $json = $hf.get-file('enc/withjinja', 'tokenizer.json');
+	my %parsed = from-json($json);
+
+	ok %parsed<model><vocab>{VOCAB-TOKEN}:exists,
+		'the byte-level BPE vocab token survived the round trip';
+	is %parsed<model><vocab>{VOCAB-TOKEN}, 1, 'and kept its id';
+};
+
+subtest 'get-file-to-file writes UTF-8, not double-encoded latin-1' => {
+	plan 3;
+	# This is where a bad decode becomes permanent: the string is
+	# spurt back out as UTF-8, so a latin-1 misread lands on disk
+	# double-encoded and every later reader inherits it.
+	my IO::Path $tmp = $*TMPDIR.add("hf-body-encoding-{$*PID}-{(^1_000_000).pick}.json");
+	LEAVE { try $tmp.unlink }
+
+	$hf.get-tokenizer-to-file('enc/withjinja', $tmp);
+	ok $tmp.e, 'file written';
+
+	my %parsed = from-json($tmp.slurp(:enc<utf8>));
+	ok %parsed<model><vocab>{VOCAB-TOKEN}:exists,
+		'the file on disk reads back as the original token';
+	# A latin-1 misread re-spurt as UTF-8 inflates every non-ASCII
+	# byte, so the byte count is the cheapest proof the round trip was
+	# lossless — regardless of the key order to-json happened to emit.
+	is $tmp.s, $TOKENIZER-BODY.elems,
+		"the file is {$TOKENIZER-BODY.elems} bytes, same as the wire body — no double encoding";
+};
+
+subtest 'get-chat-template round-trips both source shapes' => {
+	plan 3;
+
+	is $hf.get-chat-template('enc/withjinja'), TEMPLATE,
+		'standalone chat_template.jinja survived the round trip';
+	is $hf.get-chat-template('enc/nojinja'), TEMPLATE,
+		'the tokenizer_config.json fallback survived the round trip too';
+	nok $hf.get-chat-template('enc/bare').defined,
+		'a repo with neither source still reports absence, not an empty string';
+};
+
+subtest 'get-chat-template-to-file writes the template verbatim' => {
+	plan 2;
+	my IO::Path $tmp = $*TMPDIR.add("hf-body-encoding-{$*PID}-{(^1_000_000).pick}.jinja");
+	LEAVE { try $tmp.unlink }
+
+	my $result = $hf.get-chat-template-to-file('enc/nojinja', $tmp);
+	ok $result.defined, 'returned a path';
+	is $tmp.slurp(:enc<utf8>), TEMPLATE, 'the template on disk is byte-identical';
+};
+
+# === 8: the binary path stays binary ===
+
+subtest 'get-file-blob hands back the bytes untouched' => {
+	plan 2;
+	my Blob:D $bytes = $hf.get-file-blob('enc/withjinja', 'model.bin');
+
+	is $bytes.elems, BINARY.elems, "downloaded {$bytes.elems} bytes";
+	is-deeply $bytes.list, BINARY.list,
+		'bytes are byte-identical — no text decode on the blob path';
+};

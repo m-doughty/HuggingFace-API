@@ -2,6 +2,32 @@ Revision history for HuggingFace::API
 
 {{$NEXT}}
 
+0.2.2  2026-08-10T20:25:26+01:00
+    - Fix mojibake on every text response body. Cro's body-text falls back
+      to the encoding list ('utf-8', 'latin-1') when the Content-Type names
+      no charset, and loops it without stopping on the first success, so the
+      latin-1 attempt always overwrote the correct utf-8 decode: café came
+      back as cafÃ©. search, get-file and the get-chat-template probes now
+      decode the response bytes as UTF-8 themselves, with latin-1 kept only
+      as a fallback for bodies utf-8 cannot decode at all.
+    - This was not cosmetic: get-tokenizer-to-file, get-tokenizer-config-to-file
+      and get-chat-template-to-file spurt the decoded string back out as
+      UTF-8, so a latin-1 misread was written to disk permanently double-
+      encoded. Byte-level BPE vocab tokens (U+0100..U+01FF) and chat
+      templates are dense with exactly the characters that break.
+    - huggingface.co currently sends charset=utf-8 for text files, so the
+      canonical hub was unaffected; mirrors, self-hosted hubs, caching
+      proxies and LFS / xet redirects (application/octet-stream, no charset)
+      were not.
+    - get-file-blob / get-file-to-file are unchanged — they were already
+      blob-clean, and a regression test now pins that binary artefacts are
+      never text-decoded.
+    - Add t/05-body-encoding.rakutest: a live Cro::HTTP::Server fixture whose
+      routes all answer charset-less bytes, covering the decode helper in
+      isolation plus search / get-file / get-chat-template (both source
+      shapes) / the *-to-file writers / get-file-blob end to end. Unlike the
+      other test files this one needs no network access.
+
 0.2.1  2026-04-29T23:44:09+01:00
     - Bump Github actions to use node 24+
     - New: get-chat-template($model-id, :$revision) — fetch a
