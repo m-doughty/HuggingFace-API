@@ -2,6 +2,13 @@ Revision history for HuggingFace::API
 
 {{$NEXT}}
 
+0.2.4  2026-10-24T22:15:34+01:00
+
+    - [2026-10-24] Accepts Cro::HTTP 0.8.11 or later. The exact 0.8.11 pin
+      made zef install that release next to whatever newer Cro::HTTP was
+      already present, leaving two versions side by side in one
+      installation.
+
 0.2.3  2026-10-24T18:37:20+01:00
 
     - [2026-10-24] Fix every API call leaving its connection open until the
