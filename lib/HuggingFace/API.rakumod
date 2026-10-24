@@ -47,10 +47,15 @@ sub extract-chat-template-from-config(Str:D $json --> Str) is export {
 has Str:D $.base-url = 'https://huggingface.co';
 has Str $.api-key;
 
+# Built per call, so `:!persistent`: a persistent client (Cro's default)
+# keeps its connection cached inside the client, and a client that is
+# dropped after one request leaves that socket open until the process
+# exits.
 method !client(--> Cro::HTTP::Client:D) {
 	Cro::HTTP::Client.new(
 		:headers(self!headers),
 		:http<1.1>,
+		:!persistent,
 	);
 }
 

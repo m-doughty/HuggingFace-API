@@ -1,0 +1,212 @@
+use Test;
+use lib 'lib';
+
+use HuggingFace::API;
+
+# Connection hygiene: every request must give its socket back.
+#
+# Cro::HTTP::Client.new defaults to `persistent => True`, so a client
+# that is built for one request and then dropped leaves its connection
+# cached inside an object nobody can reach any more: the socket stays
+# open until the process exits, whatever the garbage collector does.
+# Every API call leaked one descriptor on the client side (plus one on
+# the server side when both ends share a process), so enough calls
+# exhausted the open-file limit -- 256 on a stock macOS terminal -- and
+# from then on new connections were accepted and immediately closed,
+# which Cro reports as a messageless PipelineClosedBeforeHeaders.
+#
+# The fixture below is a raw TCP server, not Cro, because the point is
+# to answer the way an HTTP/1.1 keep-alive server really does: a
+# complete response with a Content-Length, and no close of its own. The
+# one thing that makes it hang up is the request saying
+# `Connection: close` (RFC 9112 section 9.6), which is exactly what Cro
+# sends when the client is not persistent. A client that asked for
+# nothing of the kind -- the old, persistent one -- is therefore left
+# with a connection that only its own side can ever end, and the
+# open-connection count is the thing under test.
+
+plan 6;
+
+constant CALLS   = 20;
+constant TIMEOUT = 30;
+constant SETTLE  = 5;
+
+constant MODEL-ID = 'leak/model';
+
+# --- the fixture server ---------------------------------------------------
+
+my Lock $lock .= new;
+my Int  $open     = 0;
+my Int  $accepted = 0;
+my @conns;
+
+#| Index of the first byte after the blank line that ends a request
+#| head, or an undefined Int while the head is still incomplete. Works
+#| on the Buf because Str would fold CRLF into one grapheme.
+sub head-end(Blob:D $buf --> Int) {
+	for 0 .. $buf.bytes - 4 -> $i {
+		return $i + 4 if $buf[$i] == 13 && $buf[$i + 1] == 10
+			&& $buf[$i + 2] == 13 && $buf[$i + 3] == 10;
+	}
+	Int;
+}
+
+#| Pull one complete request off the front of $pending. Returns
+#| (method, target, wants-close) and consumes its bytes, or an empty
+#| list when the request has not fully arrived yet.
+sub take-request(Buf:D $pending is rw --> List) {
+	my $end = head-end($pending);
+	return () without $end;
+
+	my @lines = $pending.subbuf(0, $end).decode('latin-1').lines;
+	my Int  $length = 0;
+	my Bool $close  = False;
+	for @lines.skip -> $line {
+		$length = $0.Int if $line ~~ / :i ^ 'content-length:' \s* (\d+) /;
+		$close  = True   if $line ~~ / :i ^ 'connection:' \s* 'close' /;
+	}
+	return () if $pending.bytes < $end + $length;
+
+	my ($method, $target) = @lines[0].words;
+	$pending = $pending.subbuf($end + $length);
+	($method, $target, $close);
+}
+
+#| What the fixture answers for each route: (status line, content
+#| type, body).
+sub route(Str:D $method, Str:D $target --> List) {
+	my $path = $target.split('?').head;
+	given $path {
+		when '/api/models' {
+			('200 OK', 'application/json', (
+				'[{"modelId":"leak/model","author":"leak","downloads":1,"likes":2,'
+				~ '"pipeline_tag":"text-generation","tags":["a"],"description":"d"}]'
+			).encode('utf-8'));
+		}
+		when '/leak/model/resolve/main/config.json' {
+			('200 OK', 'text/plain', '{"ok":true}'.encode('utf-8'));
+		}
+		when '/leak/model/resolve/main/model.bin' {
+			('200 OK', 'application/octet-stream', Buf.new(0, 1, 2, 3, 0xFF));
+		}
+		when '/leak/model/resolve/main/chat_template.jinja' {
+			('200 OK', 'text/plain', 'TEMPLATE'.encode('utf-8'));
+		}
+		when '/leak/embedded/resolve/main/chat_template.jinja' {
+			('404 Not Found', 'text/plain', 'not found'.encode('utf-8'));
+		}
+		when '/leak/embedded/resolve/main/tokenizer_config.json' {
+			('200 OK', 'application/json',
+				'{"chat_template":"EMBEDDED"}'.encode('utf-8'));
+		}
+		default {
+			('404 Not Found', 'text/plain', 'unrouted'.encode('utf-8'));
+		}
+	}
+}
+
+sub response(Str:D $status, Str:D $type, Blob:D $body, Bool:D $close --> Blob) {
+	my Blob $head = (
+		"HTTP/1.1 $status\r\n",
+		"Content-Type: $type\r\n",
+		"Content-Length: {$body.bytes}\r\n",
+		"Connection: {$close ?? 'close' !! 'keep-alive'}\r\n",
+		"\r\n",
+	).join.encode('latin-1');
+	$head ~ $body;
+}
+
+my $listener = IO::Socket::Async.listen('127.0.0.1', 0);
+my $tap = $listener.tap(
+	-> $conn {
+		$lock.protect({ $open++; $accepted++; @conns.push($conn) });
+		my Buf $pending .= new;
+		$conn.Supply(:bin).tap(
+			-> Blob $chunk {
+				$pending.append($chunk);
+				while take-request($pending) -> ($method, $target, $close) {
+					my ($status, $type, $body) = route($method, $target);
+					# The client may already be gone; a failed write
+					# here is not the test's business.
+					$conn.write(response($status, $type, $body, $close))
+						.then(-> $p {
+							try $p.result;
+							try $conn.close if $close;
+						});
+				}
+			},
+			# The connection supply ends when the client closes.
+			done => { $lock.protect({ $open-- }) },
+			quit => -> $err { $lock.protect({ $open-- }) },
+		);
+	},
+	quit => -> $err { },
+);
+
+my $port;
+react {
+	whenever Promise.in(TIMEOUT) { die "listener never bound" }
+	whenever $tap.socket-port { $port = $_; done }
+}
+
+LEAVE {
+	for $lock.protect({ @conns.clone }) { try .close }
+	try $tap.close;
+}
+
+#| Block, bounded, until every connection the fixture accepted has been
+#| closed by the client; returns the count still open.
+sub settle(--> Int) {
+	my Instant $deadline = now + SETTLE;
+	loop {
+		my $n = $lock.protect({ $open });
+		return $n if $n == 0 || now > $deadline;
+		sleep 0.05;
+	}
+}
+
+#| Run $call CALLS times and check what each returns. Then wait for the
+#| connections to settle and assert none are left open.
+sub no-leak(Str:D $what, &call, &check) {
+	subtest "$what leaves no connection open" => {
+		plan 3;
+		my Int $before = $lock.protect({ $accepted });
+		my @results = (^CALLS).map({ call() });
+		ok @results.grep({ check($_) }).elems == CALLS,
+			"all {CALLS} calls got the fixture's answer";
+		ok $lock.protect({ $accepted }) - $before >= 1,
+			'the calls really went over the wire';
+		is settle(), 0, 'every connection was closed by the client';
+	}
+}
+
+my HuggingFace::API $hf .= new(:base-url("http://127.0.0.1:$port"));
+
+no-leak 'search',
+	{ $hf.search('leak', :limit(1)) },
+	-> @r { @r.elems == 1 && @r[0]<id> eq MODEL-ID };
+
+no-leak 'get-file',
+	{ $hf.get-file(MODEL-ID, 'config.json') },
+	-> $r { $r eq '{"ok":true}' };
+
+no-leak 'get-file-blob',
+	{ $hf.get-file-blob(MODEL-ID, 'model.bin') },
+	-> $r { $r ~~ Blob && $r.bytes == 5 && $r[4] == 0xFF };
+
+no-leak 'get-chat-template (standalone template)',
+	{ $hf.get-chat-template(MODEL-ID) },
+	-> $r { $r eq 'TEMPLATE' };
+
+no-leak 'get-chat-template (404 probe, then embedded config)',
+	{ $hf.get-chat-template('leak/embedded') },
+	-> $r { $r eq 'EMBEDDED' };
+
+no-leak 'get-file-to-file',
+	{
+		my IO::Path $tmp = $*TMPDIR.add("hf-leak-test-{$*PID}-{(^1000000).pick}.bin");
+		LEAVE { try $tmp.unlink }
+		$hf.get-file-to-file(MODEL-ID, 'model.bin', $tmp);
+		$tmp.slurp(:bin);
+	},
+	-> $r { $r.bytes == 5 };

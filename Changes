@@ -2,6 +2,22 @@ Revision history for HuggingFace::API
 
 {{$NEXT}}
 
+0.2.3  2026-10-24T18:37:20+01:00
+
+    - [2026-10-24] Fix every API call leaving its connection open until the
+      process exited. Each call builds its own Cro::HTTP::Client, which
+      defaults to persistent connections, so the socket stayed cached in a
+      client that was then thrown away. Enough calls (search, get-file,
+      get-tokenizer, get-chat-template and friends) used up the process's
+      open-file limit -- 256 on a stock macOS terminal -- after which new
+      requests failed with a messageless PipelineClosedBeforeHeaders. The
+      per-call client is now non-persistent, so each connection is closed
+      once its response is done.
+    - Requires JSON::Fast 0.21.0 or later (zef:timo). 0.19 (cpan:TIMOTIMO)
+      fails its own tests under the RakuAST compiler frontend that Rakudo
+      2026.09 makes the default, so installing this distribution stopped
+      at that dependency.
+
 0.2.2  2026-08-10T20:25:26+01:00
     - Fix mojibake on every text response body. Cro's body-text falls back
       to the encoding list ('utf-8', 'latin-1') when the Content-Type names
